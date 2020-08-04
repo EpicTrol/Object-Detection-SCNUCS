@@ -1,7 +1,32 @@
 # Object-Detection-SCNUCS
  Research on Lightweight  Fast Object Detection of SCNUCS
 
-##**TODO**
+## 简介
+
+本仓库主要包含code和docs等文件夹（外加一些数据存放在data中）。其中code文件夹是相关知识的jupyter notebook代码；docs文件夹就是markdown格式的相关内容学习，可利用[docsify](https://docsify.js.org/#/zh-cn/)将网页文档部署到GitHub Pages上，在本地以网页形式访问文档，具体使用方法如下：
+
+先安装`docsify-cli`工具：（注：npm是node.js，要先安装好）
+
+``` shell
+npm i docsify-cli -g
+```
+
+然后将本项目clone到本地（如已clone则在根目录打开命令行窗口）：
+
+``` shell
+git clone https://github.com/EpicTrol/Object-Detection-SCNUCS.git
+cd Object-Detection-SCNUCS
+```
+
+然后运行一个本地服务器，在命令行输入：
+
+``` shell
+docsify serve docs
+```
+
+这样就可以很方便的在`http://localhost:3000`实时访问文档网页渲染效果。
+
+## TODO
 
 + CNN详细解析
 

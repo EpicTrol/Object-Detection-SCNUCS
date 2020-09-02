@@ -1047,7 +1047,229 @@ with fluid.dygraph.guard():
 
 我们已经知道怎么计算这些预测值和标签了，但是遗留了一个小问题，就是没有标注出哪些锚框的objectness为-1。为了完成这一步，我们需要计算出所有预测框跟真实框之间的IoU，然后把那些IoU大于阈值的真实框挑选出来。实现代码如下：
 
-······
+```python
+# 挑选出跟真实框IoU大于阈值的预测框
+def get_iou_above_thresh_inds(pred_box, gt_boxes, iou_threshold):
+    batchsize = pred_box.shape[0]
+    num_rows = pred_box.shape[1]
+    num_cols = pred_box.shape[2]
+    num_anchors = pred_box.shape[3]
+    ret_inds = np.zeros([batchsize, num_rows, num_cols, num_anchors])
+    # 对图片循环
+    for i in range(batchsize):
+        pred_box_i = pred_box[i]
+        gt_boxes_i = gt_boxes[i]
+        # 对真实框做循环
+        for k in range(len(gt_boxes_i)): #gt in gt_boxes_i:
+            gt = gt_boxes_i[k]
+            # 转为xyxy形式
+            gtx_min = gt[0] - gt[2] / 2.
+            gty_min = gt[1] - gt[3] / 2.
+            gtx_max = gt[0] + gt[2] / 2.
+            gty_max = gt[1] + gt[3] / 2.
+            # 跳过无效的真实框
+            if (gtx_max - gtx_min < 1e-3) or (gty_max - gty_min < 1e-3):
+                continue
+            # 计算预测框跟真实框的交叠区域坐标 利用Numpy的矩阵操作特性一次计算所有预测框
+            x1 = np.maximum(pred_box_i[:, :, :, 0], gtx_min)
+            y1 = np.maximum(pred_box_i[:, :, :, 1], gty_min)
+            x2 = np.minimum(pred_box_i[:, :, :, 2], gtx_max)
+            y2 = np.minimum(pred_box_i[:, :, :, 3], gty_max)
+            intersection = np.maximum(x2 - x1, 0.) * np.maximum(y2 - y1, 0.)
+            s1 = (gty_max - gty_min) * (gtx_max - gtx_min)
+            # 计算预测框的面积，利用Numpy的矩阵操作特性一次计算所有预测框
+            s2 = (pred_box_i[:, :, :, 2] - pred_box_i[:, :, :, 0]) * (pred_box_i[:, :, :, 3] - pred_box_i[:, :, :, 1])
+            union = s2 + s1 - intersection
+            iou = intersection / union
+            选出IoU超过阈值的预测框
+            above_inds = np.where(iou > iou_threshold)
+            将IoU超阈值的预测框对应编号信息设置为1
+            ret_inds[i][above_inds] = 1
+    ret_inds = np.transpose(ret_inds, (0,3,1,2))
+    # ret_inds数值为True或False，超阈值的地方为True
+    return ret_inds.astype('bool')
+```
+
+上面的函数可以得到哪些锚框的objectness需要被标注为-1，通过下面的程序，对label_objectness进行处理，将IoU大于阈值，但又不是正样本的锚框标注为-1。
+
+
+```python
+def label_objectness_ignore(label_objectness, iou_above_thresh_indices):
+    # 注意：这里不能简单的使用 label_objectness[iou_above_thresh_indices] = -1，
+    #         这样可能会造成label_objectness为1的点被设置为-1了
+    #         只有将那些被标注为0，且与真实框IoU超过阈值的预测框才被标注为-1
+    negative_indices = (label_objectness < 0.5)
+    # 如果objectness=0&&IoU>阈值，则objectness=-1
+    ignore_indices = negative_indices * iou_above_thresh_indices
+    label_objectness[ignore_indices] = -1
+    return label_objectness
+```
+
+下面通过调用这两个函数，实现如何将部分预测框的label_objectness设置为-1。
+
+
+```python
+# 读取数据
+reader = multithread_loader('/home/aistudio/work/insects/train', batch_size=2, mode='train')
+img, gt_boxes, gt_labels, im_shape = next(reader())
+# 计算出锚框对应的标签
+label_objectness, label_location, label_classification, scale_location = get_objectness_label(img,
+                                                                                              gt_boxes, gt_labels, 
+                                                                                              iou_threshold = 0.7,
+                                                                                              anchors = [116, 90, 156, 198, 373, 326],
+                                                                                              num_classes=7, downsample=32)
+NUM_ANCHORS = 3
+NUM_CLASSES = 7
+num_filters=NUM_ANCHORS * (NUM_CLASSES + 5)
+with fluid.dygraph.guard():
+    backbone = DarkNet53_conv_body(is_test=False)
+    detection = YoloDetectionBlock(ch_in=1024, ch_out=512, is_test=False)
+    conv2d_pred = Conv2D(num_channels=1024, num_filters=num_filters,  filter_size=1)
+    
+    
+    x = to_variable(img)
+    C0, C1, C2 = backbone(x)
+    route, tip = detection(C0)
+    P0 = conv2d_pred(tip)
+    
+    # anchors包含了预先设定好的锚框尺寸
+    anchors = [116, 90, 156, 198, 373, 326]
+    # downsample是特征图P0的步幅
+    pred_boxes = get_yolo_box_xxyy(P0.numpy(), anchors, num_classes=7, downsample=32)
+    iou_above_thresh_indices = get_iou_above_thresh_inds(pred_boxes, gt_boxes, iou_threshold=0.7)
+    label_objectness = label_objectness_ignore(label_objectness, iou_above_thresh_indices)
+    print(label_objectness.shape)
+```
+
+    (2, 3, 12, 12)
+
+
+使用这种方式，就可以将那些没有被标注为正样本，但又与真实框IoU比较大的样本objectness标签设置为-1了，不计算其对任何一种损失函数的贡献。计算总的损失函数的代码如下：
+
+
+```python
+def get_loss(output, label_objectness, label_location, label_classification, scales, num_anchors=3, num_classes=7):
+    # 将output从[N, C, H, W]变形为[N, NUM_ANCHORS, NUM_CLASSES + 5, H, W]
+    reshaped_output = fluid.layers.reshape(output, [-1, num_anchors, num_classes + 5, output.shape[2], output.shape[3]])
+
+    # 从output中取出跟objectness相关的预测值
+    pred_objectness = reshaped_output[:, :, 4, :, :]
+    loss_objectness = fluid.layers.sigmoid_cross_entropy_with_logits(pred_objectness, label_objectness, ignore_index=-1)# Objectness损失函数
+    ## 对第1，2，3维求和
+    #loss_objectness = fluid.layers.reduce_sum(loss_objectness, dim=[1,2,3], keep_dim=False)
+
+    # pos_samples 只有在正样本的地方取值为1.，其它地方取值全为0.
+    pos_objectness = label_objectness > 0
+    pos_samples = fluid.layers.cast(pos_objectness, 'float32')
+    pos_samples.stop_gradient=True
+
+    #从output中取出所有跟位置相关的预测值
+    tx = reshaped_output[:, :, 0, :, :]
+    ty = reshaped_output[:, :, 1, :, :]
+    tw = reshaped_output[:, :, 2, :, :]
+    th = reshaped_output[:, :, 3, :, :]
+
+    # 从label_location中取出各个位置坐标的标签
+    dx_label = label_location[:, :, 0, :, :]
+    dy_label = label_location[:, :, 1, :, :]
+    tw_label = label_location[:, :, 2, :, :]
+    th_label = label_location[:, :, 3, :, :]
+    # 计算x,y,w,h四个位置的损失函数
+    loss_location_x = fluid.layers.sigmoid_cross_entropy_with_logits(tx, dx_label)
+    loss_location_y = fluid.layers.sigmoid_cross_entropy_with_logits(ty, dy_label)
+    loss_location_w = fluid.layers.abs(tw - tw_label)
+    loss_location_h = fluid.layers.abs(th - th_label)
+
+    # 计算总的位置损失函数
+    loss_location = loss_location_x + loss_location_y + loss_location_h + loss_location_w
+
+    # 乘以scales加权系数，使小样本的权重会高一点，大样本的低一点
+    loss_location = loss_location * scales
+    # 只计算正样本的位置损失函数
+    loss_location = loss_location * pos_samples
+
+    #从output取出所有跟物体类别相关的像素点
+    pred_classification = reshaped_output[:, :, 5:5+num_classes, :, :]
+    # 计算分类相关的损失函数
+    loss_classification = fluid.layers.sigmoid_cross_entropy_with_logits(pred_classification, label_classification)
+    # 将第2维求和，计算所有分类的损失函数求和
+    loss_classification = fluid.layers.reduce_sum(loss_classification, dim=2, keep_dim=False)
+    # 只计算objectness为正的样本的分类损失函数
+    loss_classification = loss_classification * pos_samples
+    # objectness+位置+分类 三个加起来
+    total_loss = loss_objectness + loss_location + loss_classification
+    # 对每张图片内的所有样本(所有预测框)的loss进行求和
+    total_loss = fluid.layers.reduce_sum(total_loss, dim=[1,2,3], keep_dim=False)
+    # 对所有样本求平均
+    total_loss = fluid.layers.reduce_mean(total_loss)
+
+    return total_loss
+```
+
+
+```python
+# 计算损失函数
+
+# 读取数据
+reader = multithread_loader('/home/aistudio/work/insects/train', batch_size=2, mode='train')
+img, gt_boxes, gt_labels, im_shape = next(reader())
+# 计算出锚框对应的标签
+label_objectness, label_location, label_classification, scale_location = get_objectness_label(img,gt_boxes, 
+ gt_labels,                                                                                    iou_threshold = 0.7,
+ anchors = [116, 90, 156, 198, 373, 326],                                                                num_classes=7, 
+ downsample=32)
+
+NUM_ANCHORS = 3
+NUM_CLASSES = 7
+num_filters=NUM_ANCHORS * (NUM_CLASSES + 5)
+with fluid.dygraph.guard():
+    # 定义网络结构
+    backbone = DarkNet53_conv_body(is_test=False)
+    detection = YoloDetectionBlock(ch_in=1024, ch_out=512, is_test=False)
+    conv2d_pred = Conv2D(num_channels=1024, num_filters=num_filters,  filter_size=1)
+    
+    # 提取特征
+    x = to_variable(img)
+    C0, C1, C2 = backbone(x)
+    route, tip = detection(C0)
+    P0 = conv2d_pred(tip)
+    # anchors包含了预先设定好的锚框尺寸
+    anchors = [116, 90, 156, 198, 373, 326]
+    # downsample是特征图P0的步幅
+    
+    # 标注objectness=-1
+    pred_boxes = get_yolo_box_xxyy(P0.numpy(), anchors, num_classes=7, downsample=32)# 取得预测框坐标
+    iou_above_thresh_indices = get_iou_above_thresh_inds(pred_boxes, gt_boxes, iou_threshold=0.7)
+    label_objectness = label_objectness_ignore(label_objectness, iou_above_thresh_indices)
+    
+    # 将np变量转为paddle的标量
+    label_objectness = to_variable(label_objectness)
+    label_location = to_variable(label_location)
+    label_classification = to_variable(label_classification)
+    scales = to_variable(scale_location)
+    # 这些是label，没有必要计算梯度 不用考虑梯度回传
+    label_objectness.stop_gradient=True
+    label_location.stop_gradient=True
+    label_classification.stop_gradient=True
+    scales.stop_gradient=True
+    
+    total_loss = get_loss(P0, label_objectness, label_location, label_classification, scales,
+                              num_anchors=NUM_ANCHORS, num_classes=NUM_CLASSES)
+    total_loss_data = total_loss.numpy()
+    print(total_loss_data)
+    
+```
+
+    [444.7182]
+
+上面的程序计算出了总的损失函数，到这里我们已经了解到了YOLO-V3算法的大部分内容，准备好了深度学习模型需要的各种要素包括：
+
++ 读取数据
++ 标注锚框
++ 定义网络结构提取特征
++ 关联特征图和候选区域
++ 标注objectness==-1
++ 建立三种损失函数objectenss,location,classification
 
 ------
 

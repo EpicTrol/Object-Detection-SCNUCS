@@ -58,7 +58,7 @@ docsify serve docs
 
   8. 先验框Anchor Boxes
 
-  9. 常用损失函数（<https://www.cnblogs.com/ywheunji/p/13118232.html>）
+  9. [常用损失函数](https://www.cnblogs.com/ywheunji/p/13118232.html)
 
   10. Mish激活函数
 
